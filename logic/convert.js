@@ -12,6 +12,8 @@
 var YTM_PKG = 'com.google.android.apps.youtube.music';
 var SPOTIFY_PKG = 'com.spotify.music';
 var DESKTOP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
+// Link previews (like WhatsApp's) get a plain page with the song details in it.
+var PREVIEW_UA = 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)';
 var YT_HEADERS = { 'User-Agent': DESKTOP_UA, 'Cookie': 'SOCS=CAI; CONSENT=YES+1' };
 
 var why = '';
@@ -99,12 +101,21 @@ function ytSong(id) {
   } catch (e) { return null; }
 }
 
+var notes = []; // what each lookup step returned, shown when nothing is found
+
 function spotifyToken() {
   // Spotify's public embed player carries an anonymous token in its page data.
   var r = get('https://open.spotify.com/embed/track/4cOdK2wGLETKBW3PvgPWqT', { 'User-Agent': DESKTOP_UA });
-  if (!r) return null;
+  if (!r) { notes.push('token ' + why); return null; }
   var m = r.body.match(/"accessToken":"([^"]+)"/);
+  if (!m) notes.push('token missing');
   return m ? m[1] : null;
+}
+
+function goodMatch(name, artistNames, song) {
+  var ts = similar(name, song.title), as = similar(artistNames, song.artist);
+  if (ts < 0.8 || (song.artist && artistNames && as < 0.5)) return -1;
+  return ts * 2 + as - (VARIANT.test(name) && !VARIANT.test(song.title) ? 1 : 0);
 }
 
 function spotifyApiSearch(song) {
@@ -113,42 +124,84 @@ function spotifyApiSearch(song) {
   var q = 'track:' + searchTitle(song.title) + (song.artist ? ' artist:' + song.artist : '');
   var r = get('https://api.spotify.com/v1/search?type=track&limit=8&q=' + encodeURIComponent(q),
               { 'Authorization': 'Bearer ' + token });
-  if (!r) return null;
+  if (!r) { notes.push('api ' + why); return null; }
   try {
     var items = JSON.parse(r.body).tracks.items;
-    var best = null, bestScore = 0;
+    var best = null, bestScore = -1;
     for (var i = 0; i < items.length; i++) {
       var t = items[i];
       var artists = [];
       for (var a = 0; a < t.artists.length; a++) artists.push(t.artists[a].name);
-      var ts = similar(t.name, song.title), as = similar(artists.join(' '), song.artist);
-      if (ts < 0.8 || (song.artist && as < 0.5)) continue;
-      var score = ts * 2 + as - (VARIANT.test(t.name) && !VARIANT.test(song.title) ? 1 : 0) - i * 0.01;
+      var score = goodMatch(t.name, artists.join(' '), song) - i * 0.01;
       if (score > bestScore) { bestScore = score; best = t; }
     }
-    if (best) return 'https://open.spotify.com/track/' + best.id;
-    why = 'no close match';
-  } catch (e) { why = 'search failed'; }
+    if (best && bestScore >= 0) return 'https://open.spotify.com/track/' + best.id;
+    notes.push('api no close match');
+  } catch (e) { notes.push('api unreadable'); }
   return null;
 }
 
+var B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+function b64urlDecode(s) {
+  s = s.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  var out = '', buf = 0, bits = 0;
+  for (var i = 0; i < s.length; i++) {
+    var v = B64.indexOf(s.charAt(i));
+    if (v < 0) break;
+    buf = (buf << 6) | v; bits += 6;
+    if (bits >= 8) { bits -= 8; out += String.fromCharCode((buf >> bits) & 255); }
+  }
+  return out;
+}
+
+// Pull every Spotify track ID out of a search results page, in order.
+function trackIdsIn(html) {
+  var text = unescapeJson(html).replace(/&amp;/g, '&');
+  // DuckDuckGo (uddg=) and Google (/url?q=) wrap links; Bing base64-encodes them (u=a1...).
+  var extra = '';
+  var w = text.match(/(?:uddg|[?&]q|[?&]url)=https?%3A%2F%2Fopen\.spotify\.com[^&"' ]+/gi) || [];
+  for (var i = 0; i < w.length; i++) {
+    try { extra += ' ' + decodeURIComponent(w[i].replace(/^[^=]*=/, '')); } catch (e) {}
+  }
+  var bw = text.match(/[?&]u=a1([A-Za-z0-9_-]+)/g) || [];
+  for (var j = 0; j < bw.length; j++) extra += ' ' + b64urlDecode(bw[j].replace(/^.*u=a1/, ''));
+  text = extra + ' ' + text;
+  var ids = [], re = /open\.spotify\.com\/(?:intl-[a-z]{2}\/)?track\/([A-Za-z0-9]{22})/g, m;
+  while ((m = re.exec(text)) !== null) if (ids.indexOf(m[1]) === -1) ids.push(m[1]);
+  return ids;
+}
+
+// Check a candidate is really this song by reading its Spotify page.
+function verify(id, song) {
+  var r = get('https://open.spotify.com/track/' + id, { 'User-Agent': PREVIEW_UA });
+  if (!r) return 0; // can't check
+  var s = fromPage(r.body);
+  if (!s) return 0;
+  return goodMatch(s.title, s.artist, song) >= 0 ? 1 : -1;
+}
+
 function webSearchSpotify(song) {
-  var q = 'site:open.spotify.com/track ' + searchTitle(song.title) + ' ' + song.artist;
-  var pages = [
-    'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(q),
-    'https://www.bing.com/search?q=' + encodeURIComponent(q)
+  var q = searchTitle(song.title) + ' ' + song.artist + ' site:open.spotify.com/track';
+  var engines = [
+    ['ddg', 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(q), DESKTOP_UA],
+    ['google', 'https://www.google.com/search?hl=en&gbv=1&q=' + encodeURIComponent(q), 'Lynx/2.9.0 libwww-FM/2.14'],
+    ['bing', 'https://www.bing.com/search?q=' + encodeURIComponent(q), DESKTOP_UA],
+    ['brave', 'https://search.brave.com/search?q=' + encodeURIComponent(q), DESKTOP_UA],
+    ['mojeek', 'https://www.mojeek.com/search?q=' + encodeURIComponent(q), DESKTOP_UA]
   ];
-  for (var i = 0; i < pages.length; i++) {
-    var r = get(pages[i], { 'User-Agent': DESKTOP_UA });
-    if (!r) continue;
-    var text = unescapeJson(r.body).replace(/&amp;/g, '&');
-    var wrapped = text.match(/uddg=[^&"']+/g) || [];
-    for (var w = 0; w < wrapped.length; w++) {
-      try { text += ' ' + decodeURIComponent(wrapped[w].slice(5)); } catch (e) {}
+  for (var i = 0; i < engines.length; i++) {
+    var r = get(engines[i][1], { 'User-Agent': engines[i][2], 'Cookie': 'CONSENT=YES+1; SOCS=CAI' });
+    if (!r) { notes.push(engines[i][0] + ' ' + why); continue; }
+    var ids = trackIdsIn(r.body);
+    if (!ids.length) { notes.push(engines[i][0] + ' none'); continue; }
+    var fallback = null;
+    for (var k = 0; k < ids.length && k < 3; k++) {
+      var v = verify(ids[k], song);
+      if (v === 1) return 'https://open.spotify.com/track/' + ids[k];
+      if (v === 0 && !fallback) fallback = ids[k];
     }
-    var m = text.match(/open\.spotify\.com\/(?:intl-[a-z]{2}\/)?track\/([A-Za-z0-9]{22})/);
-    if (m) return 'https://open.spotify.com/track/' + m[1];
-    why = 'no result';
+    if (fallback) return 'https://open.spotify.com/track/' + fallback;
+    notes.push(engines[i][0] + ' wrong songs');
   }
   return null;
 }
@@ -156,18 +209,18 @@ function webSearchSpotify(song) {
 function youtubeToSpotify(link) {
   var id = videoId(link);
   var ytLink = id ? 'https://www.youtube.com/watch?v=' + id : link.replace('music.youtube.com', 'www.youtube.com');
-  if (!id) return { action: 'whatsapp', url: ytLink };
+  if (!id) return { action: 'whatsapp', url: ytLink, toast: 'Couldn\'t read that YouTube link, sent it as is' };
   toast('Finding it on Spotify…');
   var song = ytSong(id);
+  if (!song) notes.push('song info ' + why);
   var sp = song ? (spotifyApiSearch(song) || webSearchSpotify(song)) : null;
   if (sp) return { action: 'whatsapp', url: sp };
-  return { action: 'whatsapp', url: ytLink, toast: 'Not found on Spotify (' + why + '), sent a YouTube link' };
+  return { action: 'whatsapp', url: ytLink,
+           toast: 'Not found on Spotify: ' + (song ? song.title + ' / ' + song.artist + ' | ' : '') + notes.join(', ') };
 }
 
 // ---------- Spotify -> YouTube Music ----------
 
-// Link previews (like WhatsApp's) get a plain page with the song details in it.
-var PREVIEW_UA = 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)';
 
 function trackId(text) {
   var m = unescapeJson(text || '').match(/open\.spotify\.com\/(?:intl-[a-z]{2}\/)?track\/([A-Za-z0-9]{22})/);
