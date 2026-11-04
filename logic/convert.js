@@ -166,34 +166,77 @@ function youtubeToSpotify(link) {
 
 // ---------- Spotify -> YouTube Music ----------
 
-function spotifySong(link) {
-  var url = link.split('?')[0];
-  var r = get(url, { 'User-Agent': DESKTOP_UA });
-  if (!r) return null;
-  var html = r.body;
-  // Short links (spotify.link) land on a page that points at the real track.
-  if (!/open\.spotify\.com\/(intl-[a-z]{2}\/)?track\//.test(r.url)) {
-    var m = unescapeJson(html).match(/open\.spotify\.com\/(?:intl-[a-z]{2}\/)?track\/[A-Za-z0-9]{22}/);
-    if (!m) { why = 'not a song link'; return null; }
-    r = get('https://' + m[0], { 'User-Agent': DESKTOP_UA });
-    if (!r) return null;
-    html = r.body;
-  }
-  var title = meta(html, 'og:title');
+// Link previews (like WhatsApp's) get a plain page with the song details in it.
+var PREVIEW_UA = 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)';
+
+function trackId(text) {
+  var m = unescapeJson(text || '').match(/open\.spotify\.com\/(?:intl-[a-z]{2}\/)?track\/([A-Za-z0-9]{22})/);
+  return m ? m[1] : null;
+}
+
+// Song details from a normal Spotify page (meta tags / <title>).
+function fromPage(html) {
+  var title = meta(html, 'og:title') || meta(html, 'twitter:title');
   var artist = meta(html, 'music:musician_description');
-  if (!artist) {
-    // Page title: "Song - song and lyrics by Artist | Spotify"
-    var pt = html.match(/<title>[^<]*?song(?: and lyrics)? by ([^<|]+?)\s*\|\s*Spotify/i);
-    if (pt) artist = decodeEntities(pt[1]);
+  var pt = html.match(/<title>([^<]*)<\/title>/i);
+  pt = pt ? decodeEntities(pt[1]) : '';
+  // "Song - song and lyrics by Artist | Spotify"
+  var byM = pt.match(/^(.*?) - song(?: and lyrics)? by (.+?)\s*\|\s*Spotify/i);
+  if (byM) {
+    if (!title) title = byM[1];
+    if (!artist) artist = byM[2];
   }
   if (!artist) {
-    // og:description is either "Artist · Album · Song · 2020" or "Listen to X on Spotify. Artist · Song · 2020"
-    var parts = meta(html, 'og:description').replace(/^.*on Spotify\.\s*/, '').split(' · ');
+    // "Artist · Album · Song · 2020" or "Listen to X on Spotify. Artist · Song · 2020"
+    var parts = (meta(html, 'og:description') || meta(html, 'description'))
+      .replace(/^.*on Spotify\.\s*/, '').split(' · ');
     artist = parts[0] === 'Song' ? (parts[1] || '') : (parts[0] || '');
   }
-  artist = artist.split(/,\s*/)[0];
-  if (!title) { why = 'no song info'; return null; }
-  return { title: title, artist: artist };
+  return title ? { title: title, artist: artist } : null;
+}
+
+// Song details from Spotify's embed player data.
+function fromEmbed(id) {
+  var r = get('https://open.spotify.com/embed/track/' + id, { 'User-Agent': DESKTOP_UA });
+  if (!r) return null;
+  var t = unescapeJson(r.body);
+  var name = t.match(/"type":"track","name":"((?:[^"\\]|\\.)*)"/) || t.match(/"name":"((?:[^"\\]|\\.)*)","uri":"spotify:track:/);
+  var artist = t.match(/"artists":\[\{[^\]]*?"name":"((?:[^"\\]|\\.)*)"/) || t.match(/"subtitle":"((?:[^"\\]|\\.)*)"/);
+  if (!name) return null;
+  return { title: name[1], artist: artist ? artist[1] : '' };
+}
+
+function fromOembed(id) {
+  var r = get('https://open.spotify.com/oembed?url=' + encodeURIComponent('https://open.spotify.com/track/' + id));
+  if (!r) return null;
+  try { var j = JSON.parse(r.body); return j.title ? { title: j.title, artist: '' } : null; } catch (e) { return null; }
+}
+
+function spotifySong(link) {
+  var id = trackId(link);
+  if (!id) {
+    // Short links (spotify.link) redirect to, or mention, the real track.
+    var r0 = get(link, { 'User-Agent': PREVIEW_UA });
+    if (r0) id = trackId(r0.url) || trackId(r0.body);
+    if (!id) { why = why || 'not a song link'; return null; }
+  }
+  var page = 'https://open.spotify.com/track/' + id;
+  var tried = [], best = null;
+  var uas = [PREVIEW_UA, DESKTOP_UA];
+  for (var i = 0; i < uas.length; i++) {
+    var r = get(page, { 'User-Agent': uas[i] });
+    tried.push(r ? 'page ok' : why);
+    var s = r ? fromPage(r.body) : null;
+    if (s && s.artist) return s;
+    if (s && !best) best = s;
+  }
+  var e = fromEmbed(id);
+  tried.push(e ? 'embed ok' : why);
+  if (e && e.artist) return e;
+  var o = best || e || fromOembed(id);
+  if (o) return o; // title only still gives a decent search
+  why = 'no song info: ' + tried.join(', ');
+  return null;
 }
 
 function findYouTubeVideo(song) {
