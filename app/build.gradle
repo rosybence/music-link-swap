@@ -1,0 +1,61 @@
+plugins {
+    id 'com.android.application'
+}
+
+// Set by GitHub Actions; local builds fall back to safe defaults.
+def runNumber = (System.getenv('GITHUB_RUN_NUMBER') ?: '1').toInteger()
+def repo = System.getenv('GITHUB_REPOSITORY') ?: 'OWNER/music-link-swap'
+
+android {
+    namespace 'com.musiclinkswap'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.musiclinkswap'
+        minSdk 29
+        targetSdk 35
+        versionCode runNumber
+        versionName "1.${runNumber}"
+        buildConfigField 'String', 'REPO', "\"${repo}\""
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    signingConfigs {
+        release {
+            storeFile file('release.jks')
+            storePassword System.getenv('KEYSTORE_PASSWORD') ?: 'musiclinkswap'
+            keyAlias 'mls'
+            keyPassword System.getenv('KEYSTORE_PASSWORD') ?: 'musiclinkswap'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+
+    packaging {
+        resources {
+            excludes += ['META-INF/*']
+        }
+    }
+}
+
+dependencies {
+    implementation 'org.mozilla:rhino:1.7.15'
+}
