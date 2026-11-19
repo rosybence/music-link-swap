@@ -68,7 +68,12 @@ function videoId(url) {
 // ---------- YouTube Music -> Spotify ----------
 
 // Version words that mean "not the original recording".
-var VARIANT = /\b(live|remix|acoustic|instrumental|karaoke|sped up|slowed|cover|demo|reverb)\b/i;
+var VARIANT = /\b(live|remix|re-mix|mix|rework|bootleg|flip|vip|edit|extended|acoustic|instrumental|karaoke|sped up|slowed|nightcore|cover|demo|reverb)\b/i;
+
+// True when the candidate is a remix/live/etc. version but the original song isn't.
+function isVariantOf(candidate, original) {
+  return VARIANT.test(candidate) && !VARIANT.test(original);
+}
 
 // Title for searching: drop "(Official Video)", "- 2004 Remaster", "feat." etc.
 function searchTitle(t) {
@@ -115,7 +120,8 @@ function spotifyToken() {
 function goodMatch(name, artistNames, song) {
   var ts = similar(name, song.title), as = similar(artistNames, song.artist);
   if (ts < 0.8 || (song.artist && artistNames && as < 0.5)) return -1;
-  return ts * 2 + as - (VARIANT.test(name) && !VARIANT.test(song.title) ? 1 : 0);
+  if (isVariantOf(name, song.title)) return -1; // never swap a song for a remix
+  return ts * 2 + as;
 }
 
 function spotifyApiSearch(song) {
@@ -195,10 +201,15 @@ function webSearchSpotify(song) {
     var ids = trackIdsIn(r.body);
     if (!ids.length) { notes.push(engines[i][0] + ' none'); continue; }
     var fallback = null;
-    for (var k = 0; k < ids.length && k < 3; k++) {
+    for (var k = 0; k < ids.length && k < 5; k++) {
       var v = verify(ids[k], song);
       if (v === 1) return 'https://open.spotify.com/track/' + ids[k];
-      if (v === 0 && !fallback) fallback = ids[k];
+      // Couldn't read the Spotify page: only trust it if the search result text doesn't say remix etc.
+      if (v === 0 && !fallback) {
+        var at = r.body.indexOf(ids[k]);
+        var near = at < 0 ? '' : r.body.slice(Math.max(0, at - 400), at + 400).replace(/<[^>]+>/g, ' ');
+        if (!isVariantOf(near, song.title)) fallback = ids[k];
+      }
     }
     if (fallback) return 'https://open.spotify.com/track/' + fallback;
     notes.push(engines[i][0] + ' wrong songs');
@@ -309,7 +320,7 @@ function findYouTubeVideo(song) {
     var score = similar(title.replace(owner.replace(/ - Topic$/, '') + ' - ', ''), song.title) * 2
               + similar(owner.replace(/ - Topic$/, '').replace(/VEVO$/i, ''), song.artist)
               + (/ - Topic$/.test(owner) ? 0.5 : 0)          // official audio upload
-              + (VARIANT.test(title) && !VARIANT.test(song.title) ? -1 : 0)
+              + (isVariantOf(title, song.title) ? -3 : 0)
               - i * 0.05;                                      // slight preference for higher results
     if (score > bestScore) { bestScore = score; best = id[1]; }
   }
